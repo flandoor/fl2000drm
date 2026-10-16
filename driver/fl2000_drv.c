@@ -137,8 +137,13 @@ static int fl2000_submit_chunk(struct fl2000 *fl, const void *data,
 	struct fl2000_xfer *x;
 	int ret;
 
-	if (down_timeout(&fl->xfer_sem, msecs_to_jiffies(1000)))
+	ret = down_timeout(&fl->xfer_sem, msecs_to_jiffies(1000));
+	if (ret) {
+		drm_err_ratelimited(&fl->drm,
+				    "xfer semaphore timeout: inflight=%d ring=%u\n",
+				    atomic_read(&fl->inflight), fl->xfer_ring);
 		return -ETIMEDOUT;
+	}
 
 	x = &fl->xfers[fl->xfer_ring];
 	fl->xfer_ring = (fl->xfer_ring + 1) % FL2000_NUM_XFERS;

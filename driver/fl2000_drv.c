@@ -17,6 +17,7 @@
 #include <linux/bitops.h>
 #include <linux/vmalloc.h>
 
+#include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_damage_helper.h>
 #include <drm/drm_drv.h>
@@ -31,6 +32,7 @@
 #include <drm/drm_modes.h>
 #include <drm/drm_modeset_helper_vtables.h>
 #include <drm/drm_probe_helper.h>
+#include <drm/drm_print.h>
 
 #include "fl2000_drm.h"
 
@@ -693,7 +695,7 @@ static void fl2000_pipe_update(struct drm_simple_display_pipe *pipe,
 
 	if (fl->wire_bpp == 2)
 		drm_fb_xrgb8888_to_rgb565(&dst, NULL, shadow->data, fb, &full,
-					  &shadow->fmtcnv_state, false);
+					  &shadow->fmtcnv_state);
 	else if (fl->wire_bpp == 4)
 		drm_fb_memcpy(&dst, NULL, shadow->data, fb, &full);
 	else if (fmt == 3)
@@ -887,10 +889,10 @@ static const struct drm_driver fl2000_drm_driver = {
 	.driver_features = DRIVER_MODESET | DRIVER_GEM | DRIVER_ATOMIC,
 	.fops = &fl2000_fops,
 	DRM_GEM_SHMEM_DRIVER_OPS,
+	DRM_FBDEV_SHMEM_DRIVER_OPS,
 	.gem_prime_import = fl2000_gem_prime_import,
 	.name = DRIVER_NAME,
 	.desc = "Fresco Logic FL2000 USB display",
-	.date = "20260711",
 	.major = 1,
 	.minor = 13,
 };
@@ -1038,7 +1040,7 @@ static int fl2000_probe(struct usb_interface *intf,
 		return ret;
 	}
 
-	drm_fbdev_shmem_setup(drm, 32);
+	drm_client_setup(drm, NULL);
 
 	dev_info(&intf->dev,
 		 "FL2000DX on USB%c link%s, modes up to %s\n",

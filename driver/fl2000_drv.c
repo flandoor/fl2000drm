@@ -87,8 +87,15 @@ MODULE_PARM_DESC(pace, "frame pacing: 0=off 1=frequency-locked to the chip's sca
  * timeouts, then leaves the CRTC up with no frames (dead display).
  * If no completion lands for this long, abort the URBs, clear a halted
  * endpoint and restart the ring. Give up after MAX consecutive failures.
+ *
+ * Healthy streaming completes an URB every few hundred microseconds
+ * (the device drains ~3.8k chunks/s), and the ring never fills (it
+ * hovers ~87/128), so the semaphore only ever blocks once the device
+ * has actually stopped draining. A short submit timeout therefore costs
+ * nothing normally and cuts the black-flash to well under a second.
  */
-#define FL2000_STALL_MS		1500
+#define FL2000_STALL_MS		500
+#define FL2000_SUBMIT_TIMEOUT_MS	250
 #define FL2000_MAX_RECOVERIES	10
 
 static u32 fl2000_wire_bpp_for(struct fl2000 *fl, const struct fl2000_mode *m)
@@ -136,8 +143,11 @@ static void fl2000_xfer_complete(struct urb *urb)
 {
 	struct fl2000 *fl = urb->context;
 
-	if (urb->status)
+	if (urb->status) {
+		WRITE_ONCE(fl->last_status, urb->status);
 		atomic_cmpxchg(&fl->stream_error, 0, urb->status);
+	}
+	fl->completions++;
 	WRITE_ONCE(fl->last_complete, jiffies);
 	atomic_dec(&fl->inflight);
 	up(&fl->xfer_sem);
@@ -149,7 +159,8 @@ static int fl2000_submit_chunk(struct fl2000 *fl, const void *data,
 	struct fl2000_xfer *x;
 	int ret;
 
-	ret = down_timeout(&fl->xfer_sem, msecs_to_jiffies(1000));
+	ret = down_timeout(&fl->xfer_sem,
+			   msecs_to_jiffies(FL2000_SUBMIT_TIMEOUT_MS));
 	if (ret) {
 		drm_err_ratelimited(&fl->drm,
 				    "xfer semaphore timeout: inflight=%d ring=%u\n",
@@ -277,6 +288,11 @@ static void fl2000_stream_work(struct work_struct *work)
 			    (ret == -ETIMEDOUT &&
 			     time_after(jiffies, READ_ONCE(fl->last_complete) +
 					msecs_to_jiffies(FL2000_STALL_MS)))) {
+				u32 st = 0;
+				unsigned long idle = jiffies -
+						    READ_ONCE(fl->last_complete);
+
+				fl2000_reg_read(fl, 0x8000, &st);
 				if (++fl->recoveries > FL2000_MAX_RECOVERIES) {
 					fl2000_kill_xfers(fl);
 					drm_err(&fl->drm,
@@ -286,11 +302,13 @@ static void fl2000_stream_work(struct work_struct *work)
 					drm_kms_helper_hotplug_event(&fl->drm);
 					break;
 				}
-				ret = fl2000_recover_pipe(fl);
 				drm_warn(&fl->drm,
-					 "bulk pipe stalled, recovering (%u/%u): %d\n",
-					 fl->recoveries, FL2000_MAX_RECOVERIES,
-					 ret);
+					 "bulk pipe stalled (trigger=%d idle=%ums inflight=%d ring=%u last_status=%d completions=%lu st=0x%08X), recovering (%u/%u)\n",
+					 ret, jiffies_to_msecs(idle),
+					 atomic_read(&fl->inflight), fl->xfer_ring,
+					 READ_ONCE(fl->last_status), fl->completions,
+					 st, fl->recoveries, FL2000_MAX_RECOVERIES);
+				ret = fl2000_recover_pipe(fl);
 				if (ret && fl2000_usb_err_fatal(ret))
 					break;
 				errors = 0;
@@ -663,6 +681,8 @@ static void fl2000_pipe_enable(struct drm_simple_display_pipe *pipe,
 	atomic_set(&fl->stream_error, 0);
 	atomic_set(&fl->inflight, 0);
 	WRITE_ONCE(fl->last_complete, jiffies);
+	fl->completions = 0;
+	fl->last_status = 0;
 	fl->recoveries = 0;
 	fl->next_frame_ns = 0;
 	fl->pace_occ = 0;

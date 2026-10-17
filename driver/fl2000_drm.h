@@ -64,6 +64,8 @@ struct fl2000 {
 	u64 frame_period_ns;		/* working period, FLL-measured */
 	atomic_t inflight;		/* URBs submitted, not yet completed */
 	unsigned long last_complete;	/* jiffies of the last URB completion */
+	unsigned long completions;	/* total completions (diagnostics) */
+	int last_status;		/* last non-zero URB status seen */
 	unsigned int recoveries;	/* consecutive stall recovery attempts */
 	u64 next_frame_ns;		/* pacing absolute deadline chain */
 	u32 pace_occ_target;		/* pre-submission backlog target */

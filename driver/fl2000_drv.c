@@ -80,6 +80,17 @@ MODULE_PARM_DESC(pace, "frame pacing: 0=off 1=frequency-locked to the chip's sca
 /* above this RGB888 rate on USB3, fall back to RGB565 on the wire */
 #define FL2000_RGB888_LIMIT	320000000ULL
 
+/*
+ * Bulk-pipe stall watchdog. The FL2000 can wedge the pixel pipe
+ * (NAK-forever) mid-frame: every queued URB stops completing and the
+ * semaphore runs dry. Without recovery the worker burns ~50s of 1s
+ * timeouts, then leaves the CRTC up with no frames (dead display).
+ * If no completion lands for this long, abort the URBs, clear a halted
+ * endpoint and restart the ring. Give up after MAX consecutive failures.
+ */
+#define FL2000_STALL_MS		1500
+#define FL2000_MAX_RECOVERIES	10
+
 static u32 fl2000_wire_bpp_for(struct fl2000 *fl, const struct fl2000_mode *m)
 {
 	u64 bw888 = (u64)m->width * m->height * m->refresh * 3;
@@ -127,6 +138,7 @@ static void fl2000_xfer_complete(struct urb *urb)
 
 	if (urb->status)
 		atomic_cmpxchg(&fl->stream_error, 0, urb->status);
+	WRITE_ONCE(fl->last_complete, jiffies);
 	atomic_dec(&fl->inflight);
 	up(&fl->xfer_sem);
 }
@@ -164,6 +176,39 @@ static int fl2000_submit_chunk(struct fl2000 *fl, const void *data,
 		atomic_dec(&fl->inflight);
 		up(&fl->xfer_sem);
 	}
+	return ret;
+}
+
+/*
+ * Recover a wedged bulk pipe: abort every queued URB (their completions
+ * run synchronously with -ENOENT and release the semaphore), clear a
+ * halted bulk-OUT endpoint (a stall leaves it halted, so every
+ * resubmission would fail), then re-init the ring. Returns the
+ * usb_clear_halt status so a fatal (device-gone) error can be told apart.
+ */
+static void fl2000_kill_xfers(struct fl2000 *fl);
+
+static int fl2000_recover_pipe(struct fl2000 *fl)
+{
+	int i, ret;
+
+	for (i = 0; i < FL2000_NUM_XFERS; i++)
+		if (fl->xfers[i].urb)
+			usb_kill_urb(fl->xfers[i].urb);
+
+	ret = usb_clear_halt(fl->udev, usb_sndbulkpipe(fl->udev, 1));
+	if (ret)
+		drm_dbg(&fl->drm, "clear halt failed: %d\n", ret);
+
+	sema_init(&fl->xfer_sem, FL2000_NUM_XFERS);
+	fl->xfer_ring = 0;
+	atomic_set(&fl->inflight, 0);
+	atomic_set(&fl->stream_error, 0);
+	WRITE_ONCE(fl->last_complete, jiffies);
+	fl->next_frame_ns = 0;
+
+	/* let the endpoint settle before refilling the pipe */
+	msleep(20);
 	return ret;
 }
 
@@ -220,6 +265,37 @@ static void fl2000_stream_work(struct work_struct *work)
 					"device gone (%d), stream off\n", ret);
 				break;
 			}
+			/*
+			 * A wedged pipe shows up two ways: a dry semaphore
+			 * (no completion for FL2000_STALL_MS means the device
+			 * stopped draining) or a halted bulk-OUT endpoint
+			 * (-EPIPE on submit). In both cases abort the ring and
+			 * clear the halt now instead of burning ~50s of 1s
+			 * timeouts and leaving a dead display behind.
+			 */
+			if (ret == -EPIPE ||
+			    (ret == -ETIMEDOUT &&
+			     time_after(jiffies, READ_ONCE(fl->last_complete) +
+					msecs_to_jiffies(FL2000_STALL_MS)))) {
+				if (++fl->recoveries > FL2000_MAX_RECOVERIES) {
+					fl2000_kill_xfers(fl);
+					drm_err(&fl->drm,
+						"bulk pipe stalled, unrecoverable after %u attempts, stopping\n",
+						fl->recoveries - 1);
+					WRITE_ONCE(fl->streaming, false);
+					drm_kms_helper_hotplug_event(&fl->drm);
+					break;
+				}
+				ret = fl2000_recover_pipe(fl);
+				drm_warn(&fl->drm,
+					 "bulk pipe stalled, recovering (%u/%u): %d\n",
+					 fl->recoveries, FL2000_MAX_RECOVERIES,
+					 ret);
+				if (ret && fl2000_usb_err_fatal(ret))
+					break;
+				errors = 0;
+				continue;
+			}
 			if (++errors > 50) {
 				drm_err(&fl->drm,
 					"bulk streaming failed (%d), stopping\n",
@@ -231,6 +307,7 @@ static void fl2000_stream_work(struct work_struct *work)
 			msleep(20);
 		} else {
 			errors = 0;
+			fl->recoveries = 0;
 		}
 
 		frame_us = div_u64(ktime_get_ns() - t_frame, 1000);
@@ -585,6 +662,8 @@ static void fl2000_pipe_enable(struct drm_simple_display_pipe *pipe,
 	fl->xfer_ring = 0;
 	atomic_set(&fl->stream_error, 0);
 	atomic_set(&fl->inflight, 0);
+	WRITE_ONCE(fl->last_complete, jiffies);
+	fl->recoveries = 0;
 	fl->next_frame_ns = 0;
 	fl->pace_occ = 0;
 	fl->pace_occ_target = clamp_t(u32,

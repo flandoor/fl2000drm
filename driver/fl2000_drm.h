@@ -67,6 +67,7 @@ struct fl2000 {
 	unsigned long completions;	/* total completions (diagnostics) */
 	int last_status;		/* last non-zero URB status seen */
 	unsigned int recoveries;	/* consecutive stall recovery attempts */
+	unsigned long stall_at;		/* last_complete of a detected stall, 0=idle */
 	u64 next_frame_ns;		/* pacing absolute deadline chain */
 	u32 pace_occ_target;		/* pre-submission backlog target */
 	int pace_occ;			/* last pre-submission backlog */

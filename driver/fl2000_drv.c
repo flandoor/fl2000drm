@@ -92,11 +92,18 @@ MODULE_PARM_DESC(pace, "frame pacing: 0=off 1=frequency-locked to the chip's sca
  * (the device drains ~3.8k chunks/s), and the ring never fills (it
  * hovers ~87/128), so the semaphore only ever blocks once the device
  * has actually stopped draining. A short submit timeout therefore costs
- * nothing normally and cuts the black-flash to well under a second.
+ * nothing normally and cuts the black-flash to a few hundred ms.
+ *
+ * Keep the thresholds conservative: an -ETIMEDOUT already implies the
+ * whole ring is queued (the device fully stopped), so a transient hiccup
+ * below STALL_MS is simply retried rather than force-recovered. High modes
+ * (2560x1080 = 86 URBs/frame of 128) can fill the ring legitimately, so do
+ * not shorten the timeout further. MAX_RECOVERIES is generous so a run of
+ * false positives in a marginal patch cannot tear the stream down.
  */
-#define FL2000_STALL_MS		500
-#define FL2000_SUBMIT_TIMEOUT_MS	250
-#define FL2000_MAX_RECOVERIES	10
+#define FL2000_STALL_MS		300
+#define FL2000_SUBMIT_TIMEOUT_MS	150
+#define FL2000_MAX_RECOVERIES	30
 
 static u32 fl2000_wire_bpp_for(struct fl2000 *fl, const struct fl2000_mode *m)
 {
@@ -308,6 +315,8 @@ static void fl2000_stream_work(struct work_struct *work)
 					 atomic_read(&fl->inflight), fl->xfer_ring,
 					 READ_ONCE(fl->last_status), fl->completions,
 					 st, fl->recoveries, FL2000_MAX_RECOVERIES);
+				WRITE_ONCE(fl->stall_at,
+					   READ_ONCE(fl->last_complete));
 				ret = fl2000_recover_pipe(fl);
 				if (ret && fl2000_usb_err_fatal(ret))
 					break;
@@ -324,6 +333,13 @@ static void fl2000_stream_work(struct work_struct *work)
 			fl2000_submit_chunk(fl, NULL, 0);
 			msleep(20);
 		} else {
+			if (fl->stall_at) {
+				drm_warn(&fl->drm,
+					 "pipe restored after %ums\n",
+					 jiffies_to_msecs(jiffies -
+							  fl->stall_at));
+				fl->stall_at = 0;
+			}
 			errors = 0;
 			fl->recoveries = 0;
 		}
@@ -683,6 +699,7 @@ static void fl2000_pipe_enable(struct drm_simple_display_pipe *pipe,
 	WRITE_ONCE(fl->last_complete, jiffies);
 	fl->completions = 0;
 	fl->last_status = 0;
+	fl->stall_at = 0;
 	fl->recoveries = 0;
 	fl->next_frame_ns = 0;
 	fl->pace_occ = 0;

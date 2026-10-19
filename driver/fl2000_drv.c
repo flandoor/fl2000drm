@@ -230,6 +230,38 @@ static int fl2000_recover_pipe(struct fl2000 *fl)
 	return ret;
 }
 
+/*
+ * The chip's pixel engine can freeze while the bulk pipe keeps
+ * draining: the frame counter stops advancing and either saturates at
+ * 0xFFFF or reads the same value across two telemetry windows
+ * (~300 frames apart on a live engine). Verified via a userspace probe
+ * that this state never unwedges on its own — the display stays broken
+ * until we intervene — while a single app-reset (0x8048 bit 15,
+ * self-clearing) restarts the engine without disturbing the streamed
+ * configuration. Notice the counter asymmetry: a healthy engine always
+ * advances ~300 counts over a window at 60 Hz, so hwd == 0 is
+ * unambiguous.
+ */
+static void fl2000_chip_check_frozen(struct fl2000 *fl, u32 st, u32 hwd)
+{
+	u32 app;
+	int ret;
+
+	if (hwd && FL2000_STATUS_FRAME_CNT(st) != 0xFFFF)
+		return;
+
+	ret = fl2000_reg_read(fl, 0x8048, &app);
+	if (ret)
+		return;
+	ret = fl2000_reg_write(fl, 0x8048, app | 0x8000);
+	if (ret)
+		return;
+
+	drm_warn(&fl->drm,
+		 "chip frame counter stuck (st=0x%08X hwd=%u), chip app reset applied\n",
+		 st, hwd);
+}
+
 static void fl2000_stream_work(struct work_struct *work)
 {
 	struct fl2000 *fl = container_of(work, struct fl2000, stream_work);
@@ -327,6 +359,21 @@ static void fl2000_stream_work(struct work_struct *work)
 				ret = fl2000_recover_pipe(fl);
 				if (ret && fl2000_usb_err_fatal(ret))
 					break;
+				{
+					/*
+					 * A stalled pipe can have left the
+					 * pixel engine frozen too; heal it
+					 * now instead of waiting up to 5 s
+					 * for the telemetry check.
+					 */
+					u32 st2 = 0, hwf2, hwd2;
+
+					if (!fl2000_reg_read(fl, 0x8000, &st2)) {
+						hwf2 = FL2000_STATUS_FRAME_CNT(st2);
+						hwd2 = (hwf2 - fl->last_frame_cnt) & 0xFFFF;
+						fl2000_chip_check_frozen(fl, st2, hwd2);
+					}
+				}
 				errors = 0;
 				last_ok = jiffies;
 				continue;
@@ -432,6 +479,7 @@ static void fl2000_stream_work(struct work_struct *work)
 					 fl->frame_period_ns, fl->pace_occ,
 					 fl->pace_occ_target);
 			fl->last_frame_cnt = hwf;
+			fl2000_chip_check_frozen(fl, st, hwd);
 			if (st & (FL2000_STATUS_LBUF_OVERFLOW |
 				  FL2000_STATUS_LBUF_UNDERFLOW))
 				fl2000_reg_write(fl, 0x8000, st);

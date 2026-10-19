@@ -236,6 +236,7 @@ static void fl2000_stream_work(struct work_struct *work)
 	u64 t_win = ktime_get_ns(), t_frame;
 	u32 frames = 0, frame_us, min_us = U32_MAX, max_us = 0;
 	int errors = 0;
+	unsigned long last_ok = jiffies;
 	int idx;
 
 	if (!drm_dev_enter(&fl->drm, &idx))
@@ -284,17 +285,23 @@ static void fl2000_stream_work(struct work_struct *work)
 				break;
 			}
 			/*
-			 * A wedged pipe shows up two ways: a dry semaphore
-			 * (no completion for FL2000_STALL_MS means the device
-			 * stopped draining) or a halted bulk-OUT endpoint
-			 * (-EPIPE on submit). In both cases abort the ring and
-			 * clear the halt now instead of burning ~50s of 1s
+			 * A wedged pipe shows up several ways: a dry
+			 * semaphore (no completion for FL2000_STALL_MS means
+			 * the device stopped draining), a semaphore that
+			 * stays dry while only trickling completions (the
+			 * ring never frees, so no whole frame goes out for
+			 * FL2000_STALL_MS even though last_complete keeps
+			 * advancing), or a halted bulk-OUT endpoint (-EPIPE
+			 * on submit). In all cases abort the ring and clear
+			 * the halt now instead of burning ~50s of 1s
 			 * timeouts and leaving a dead display behind.
 			 */
 			if (ret == -EPIPE ||
 			    (ret == -ETIMEDOUT &&
-			     time_after(jiffies, READ_ONCE(fl->last_complete) +
-					msecs_to_jiffies(FL2000_STALL_MS)))) {
+			     (time_after(jiffies, READ_ONCE(fl->last_complete) +
+					 msecs_to_jiffies(FL2000_STALL_MS)) ||
+			      time_after(jiffies, last_ok +
+					 msecs_to_jiffies(FL2000_STALL_MS))))) {
 				u32 st = 0;
 				unsigned long idle = jiffies -
 						    READ_ONCE(fl->last_complete);
@@ -321,6 +328,7 @@ static void fl2000_stream_work(struct work_struct *work)
 				if (ret && fl2000_usb_err_fatal(ret))
 					break;
 				errors = 0;
+				last_ok = jiffies;
 				continue;
 			}
 			if (++errors > 50) {
@@ -342,6 +350,7 @@ static void fl2000_stream_work(struct work_struct *work)
 			}
 			errors = 0;
 			fl->recoveries = 0;
+			last_ok = jiffies;
 		}
 
 		frame_us = div_u64(ktime_get_ns() - t_frame, 1000);

@@ -232,23 +232,19 @@ static int fl2000_recover_pipe(struct fl2000 *fl)
 
 /*
  * The chip's pixel engine can freeze while the bulk pipe keeps
- * draining: the frame counter stops advancing and either saturates at
- * 0xFFFF or reads the same value across two telemetry windows
- * (~300 frames apart on a live engine). Verified via a userspace probe
- * that this state never unwedges on its own — the display stays broken
- * until we intervene — while a single app-reset (0x8048 bit 15,
- * self-clearing) restarts the engine without disturbing the streamed
- * configuration. Notice the counter asymmetry: a healthy engine always
- * advances ~300 counts over a window at 60 Hz, so hwd == 0 is
- * unambiguous.
+ * draining: the frame counter then reads its 0xFFFF saturation (or
+ * simply stops advancing). Verified via a userspace probe that this
+ * state never unwedges on its own — the display stays broken until we
+ * intervene — while a single app-reset (0x8048 bit 15, self-clearing)
+ * restarts the engine without disturbing the streamed configuration.
+ * A healthy counter also reads 0xFFFF for one frame every 65536-frame
+ * wrap (~18 min at 60 Hz), so callers must confirm the signature
+ * across consecutive samples.
  */
-static void fl2000_chip_check_frozen(struct fl2000 *fl, u32 st, u32 hwd)
+static void fl2000_chip_app_reset(struct fl2000 *fl, u32 st, const char *reason)
 {
 	u32 app;
 	int ret;
-
-	if (hwd && FL2000_STATUS_FRAME_CNT(st) != 0xFFFF)
-		return;
 
 	ret = fl2000_reg_read(fl, 0x8048, &app);
 	if (ret)
@@ -257,9 +253,8 @@ static void fl2000_chip_check_frozen(struct fl2000 *fl, u32 st, u32 hwd)
 	if (ret)
 		return;
 
-	drm_warn(&fl->drm,
-		 "chip frame counter stuck (st=0x%08X hwd=%u), chip app reset applied\n",
-		 st, hwd);
+	drm_warn(&fl->drm, "%s (st=0x%08X), chip app reset applied\n",
+		 reason, st);
 }
 
 static void fl2000_stream_work(struct work_struct *work)
@@ -269,6 +264,11 @@ static void fl2000_stream_work(struct work_struct *work)
 	u32 frames = 0, frame_us, min_us = U32_MAX, max_us = 0;
 	int errors = 0;
 	unsigned long last_ok = jiffies;
+	/* frozen-engine watch: 100 ms sampling, twice to confirm */
+	u64 fast_ts = 0;
+	u32 fast_cnt = 0;
+	bool fast_seen = false, fast_frozen = false;
+	unsigned long fast_reset_at = 0;
 	int idx;
 
 	if (!drm_dev_enter(&fl->drm, &idx))
@@ -363,15 +363,17 @@ static void fl2000_stream_work(struct work_struct *work)
 					/*
 					 * A stalled pipe can have left the
 					 * pixel engine frozen too; heal it
-					 * now instead of waiting up to 5 s
-					 * for the telemetry check.
+					 * now instead of waiting for the
+					 * periodic watch.
 					 */
 					u32 st2 = 0, hwf2, hwd2;
 
 					if (!fl2000_reg_read(fl, 0x8000, &st2)) {
 						hwf2 = FL2000_STATUS_FRAME_CNT(st2);
 						hwd2 = (hwf2 - fl->last_frame_cnt) & 0xFFFF;
-						fl2000_chip_check_frozen(fl, st2, hwd2);
+						if (!hwd2 || hwf2 == 0xFFFF)
+							fl2000_chip_app_reset(fl, st2,
+									      "chip frame counter stuck");
 					}
 				}
 				errors = 0;
@@ -479,7 +481,9 @@ static void fl2000_stream_work(struct work_struct *work)
 					 fl->frame_period_ns, fl->pace_occ,
 					 fl->pace_occ_target);
 			fl->last_frame_cnt = hwf;
-			fl2000_chip_check_frozen(fl, st, hwd);
+			if (!hwd || hwf == 0xFFFF)
+				fl2000_chip_app_reset(fl, st,
+						      "chip frame counter stuck");
 			if (st & (FL2000_STATUS_LBUF_OVERFLOW |
 				  FL2000_STATUS_LBUF_UNDERFLOW))
 				fl2000_reg_write(fl, 0x8000, st);
@@ -487,6 +491,38 @@ static void fl2000_stream_work(struct work_struct *work)
 			min_us = U32_MAX;
 			max_us = 0;
 			t_win = ktime_get_ns();
+		}
+		/*
+		 * The 5 s telemetry window above is too coarse to catch a
+		 * freeze (the worker itself slows down while the engine
+		 * is dead, which stretches the window even further), so
+		 * sample the counter at 100 ms and require two
+		 * consecutive frozen samples: that filters the legitimate
+		 * 0xFFFF a healthy counter reads for one frame per
+		 * 65536-frame wrap.
+		 */
+		if (ktime_get_ns() - fast_ts >= 100 * NSEC_PER_MSEC) {
+			u32 fst = 0;
+
+			fast_ts = ktime_get_ns();
+			if (!fl2000_reg_read(fl, 0x8000, &fst)) {
+				u32 cnt = FL2000_STATUS_FRAME_CNT(fst);
+				bool frozen = cnt == 0xFFFF ||
+					      (fast_seen && cnt == fast_cnt);
+
+				if (frozen && fast_frozen &&
+				    time_after(jiffies, fast_reset_at +
+					       msecs_to_jiffies(2000))) {
+					fl2000_chip_app_reset(fl, fst,
+							      "chip frame counter stuck");
+					fast_reset_at = jiffies;
+				}
+				fast_frozen = frozen;
+				fast_cnt = cnt;
+				fast_seen = true;
+			} else {
+				fast_frozen = false;
+			}
 		}
 		cond_resched();
 	}

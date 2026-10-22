@@ -131,6 +131,7 @@ struct fl2000 {
 
 /* fl2000_hw.c */
 int fl2000_reg_read(struct fl2000 *fl, u16 offset, u32 *val);
+int fl2000_reg_read_try(struct fl2000 *fl, u16 offset, u32 *val);
 int fl2000_reg_write(struct fl2000 *fl, u16 offset, u32 val);
 int fl2000_i2c_read32(struct fl2000 *fl, u8 addr, u8 offset, u32 *val);
 int fl2000_i2c_write32(struct fl2000 *fl, u8 addr, u8 offset, u32 val);

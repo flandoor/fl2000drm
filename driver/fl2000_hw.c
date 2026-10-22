@@ -54,6 +54,23 @@ int fl2000_reg_read(struct fl2000 *fl, u16 offset, u32 *val)
 	return ret;
 }
 
+/*
+ * Non-blocking variant for the streaming worker: hw_lock is also held
+ * across slow DDC/EDID sequences (bus-hang aborts can take seconds), and
+ * the stream must never wait on those or it starves the pixel pipe.
+ * Returns -EBUSY when the lock is busy so the caller can skip the sample.
+ */
+int fl2000_reg_read_try(struct fl2000 *fl, u16 offset, u32 *val)
+{
+	int ret;
+
+	if (!mutex_trylock(&fl->hw_lock))
+		return -EBUSY;
+	ret = fl2000_reg_read_locked(fl, offset, val);
+	mutex_unlock(&fl->hw_lock);
+	return ret;
+}
+
 int fl2000_reg_write(struct fl2000 *fl, u16 offset, u32 val)
 {
 	int ret;

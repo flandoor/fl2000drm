@@ -328,17 +328,29 @@ static void fl2000_stream_work(struct work_struct *work)
 			 * the halt now instead of burning ~50s of 1s
 			 * timeouts and leaving a dead display behind.
 			 */
+			/*
+			 * A dry semaphore on the very first submit timeout
+			 * already proves the wedge: the ring holds all
+			 * FL2000_NUM_XFERS URBs and not one completed for
+			 * FL2000_SUBMIT_TIMEOUT_MS. A healthy device drains
+			 * the whole ring in a few tens of ms, so waiting the
+			 * extra FL2000_STALL_MS here only lengthens the black
+			 * flash by ~350 ms.
+			 */
 			if (ret == -EPIPE ||
 			    (ret == -ETIMEDOUT &&
-			     (time_after(jiffies, READ_ONCE(fl->last_complete) +
+			     (atomic_read(&fl->inflight) >=
+				      (int)FL2000_NUM_XFERS - 1 ||
+			      time_after(jiffies, READ_ONCE(fl->last_complete) +
 					 msecs_to_jiffies(FL2000_STALL_MS)) ||
 			      time_after(jiffies, last_ok +
 					 msecs_to_jiffies(FL2000_STALL_MS))))) {
 				u32 st = 0;
+				bool st_ok;
 				unsigned long idle = jiffies -
 						    READ_ONCE(fl->last_complete);
 
-				fl2000_reg_read(fl, 0x8000, &st);
+				st_ok = !fl2000_reg_read_try(fl, 0x8000, &st);
 				if (++fl->recoveries > FL2000_MAX_RECOVERIES) {
 					fl2000_kill_xfers(fl);
 					drm_err(&fl->drm,
@@ -364,17 +376,23 @@ static void fl2000_stream_work(struct work_struct *work)
 					 * A stalled pipe can have left the
 					 * pixel engine frozen too; heal it
 					 * now instead of waiting for the
-					 * periodic watch.
+					 * periodic watch. Compare against
+					 * the pre-recovery sample: the
+					 * counter advances every frame while
+					 * the engine is alive, so an equal
+					 * count means it did not restart.
+					 * last_frame_cnt is useless here —
+					 * it only refreshes once per
+					 * telemetry window (up to 5 s stale).
 					 */
-					u32 st2 = 0, hwf2, hwd2;
+					u32 st2 = 0;
 
-					if (!fl2000_reg_read(fl, 0x8000, &st2)) {
-						hwf2 = FL2000_STATUS_FRAME_CNT(st2);
-						hwd2 = (hwf2 - fl->last_frame_cnt) & 0xFFFF;
-						if (!hwd2 || hwf2 == 0xFFFF)
-							fl2000_chip_app_reset(fl, st2,
-									      "chip frame counter stuck");
-					}
+					if (st_ok &&
+					    !fl2000_reg_read_try(fl, 0x8000, &st2) &&
+					    FL2000_STATUS_FRAME_CNT(st2) ==
+					    FL2000_STATUS_FRAME_CNT(st))
+						fl2000_chip_app_reset(fl, st2,
+								      "chip frame counter stuck");
 				}
 				errors = 0;
 				last_ok = jiffies;
@@ -481,7 +499,14 @@ static void fl2000_stream_work(struct work_struct *work)
 					 fl->frame_period_ns, fl->pace_occ,
 					 fl->pace_occ_target);
 			fl->last_frame_cnt = hwf;
-			if (!hwd || hwf == 0xFFFF)
+			/*
+			 * Only the full-window advance is reliable here:
+			 * a healthy counter reads 0xFFFF for one frame
+			 * every 65536-frame wrap, so testing hwf alone
+			 * would force a spurious app reset (and a blink)
+			 * once per wrap.
+			 */
+			if (!hwd)
 				fl2000_chip_app_reset(fl, st,
 						      "chip frame counter stuck");
 			if (st & (FL2000_STATUS_LBUF_OVERFLOW |
@@ -499,13 +524,15 @@ static void fl2000_stream_work(struct work_struct *work)
 		 * sample the counter at 100 ms and require two
 		 * consecutive frozen samples: that filters the legitimate
 		 * 0xFFFF a healthy counter reads for one frame per
-		 * 65536-frame wrap.
+		 * 65536-frame wrap. Use the trylock read so a slow DDC
+		 * sequence holding hw_lock cannot park the worker here and
+		 * starve the pixel pipe.
 		 */
 		if (ktime_get_ns() - fast_ts >= 100 * NSEC_PER_MSEC) {
 			u32 fst = 0;
 
 			fast_ts = ktime_get_ns();
-			if (!fl2000_reg_read(fl, 0x8000, &fst)) {
+			if (!fl2000_reg_read_try(fl, 0x8000, &fst)) {
 				u32 cnt = FL2000_STATUS_FRAME_CNT(fst);
 				bool frozen = cnt == 0xFFFF ||
 					      (fast_seen && cnt == fast_cnt);

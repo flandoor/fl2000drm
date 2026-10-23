@@ -65,6 +65,32 @@ static int pace = 1;
 module_param(pace, int, 0644);
 MODULE_PARM_DESC(pace, "frame pacing: 0=off 1=frequency-locked to the chip's scanout (default)");
 
+/*
+ * Isochronous transport (experimental). Interface 1 exposes an isoc OUT
+ * endpoint (EP 0x02) whose companion descriptors announce 16-48 kB per
+ * bus interval, i.e. 131-393 MB/s. Unlike bulk it cannot NAK, so the
+ * device-side FIFO never underruns from host scheduling jitter; each
+ * altsetting is a fixed bandwidth contract. The pixel pipeline is
+ * identical, only the delivery timing and the EOF marker differ.
+ * Requires a SuperSpeed link and a mode with ISO table values (1080p).
+ */
+static int iso;
+module_param(iso, int, 0644);
+MODULE_PARM_DESC(iso, "isochronous transfer path: 0=bulk (default) 1=iso if available");
+
+/* ISO framing experiments, applied on the next display enable */
+static int iso_eof = 29;
+module_param(iso_eof, int, 0644);
+MODULE_PARM_DESC(iso_eof, "iso frame end marker: 28=zero-length packet 29=packet pending (default)");
+
+static int iso_upd;
+module_param(iso_upd, int, 0644);
+MODULE_PARM_DESC(iso_upd, "iso: also set MFRAME_CNT_UPDATE (0x801C bit 30)");
+
+static int iso_pkts;
+module_param(iso_pkts, int, 0644);
+MODULE_PARM_DESC(iso_pkts, "iso: packets per frame override (0 = table value)");
+
 /* VGA status register 0x8000 decode (reference register map) */
 #define FL2000_STATUS_VGA_ERROR		BIT(1)
 #define FL2000_STATUS_LBUF_HALT		BIT(2)
@@ -104,6 +130,19 @@ MODULE_PARM_DESC(pace, "frame pacing: 0=off 1=frequency-locked to the chip's sca
 #define FL2000_STALL_MS		300
 #define FL2000_SUBMIT_TIMEOUT_MS	150
 #define FL2000_MAX_RECOVERIES	30
+
+/*
+ * Isochronous framing, from the reference table: 128 data packets plus
+ * empty packets fill exactly one 8000-interval/s frame; the chip is
+ * told the packet count through 0x801C. ISO URBs are naturally paced by
+ * the host controller at one packet per 125 us microframe, so no
+ * software pacing is needed.
+ */
+#define FL2000_ISO_URBS		2
+#define FL2000_ISO_DATA_PACKETS	128
+#define FL2000_ISO_INTERVAL_NS	125000
+#define FL2000_ISO_SUBMIT_MS	500
+#define FL2000_ISO_MAX_TIMEOUTS	3
 
 static u32 fl2000_wire_bpp_for(struct fl2000 *fl, const struct fl2000_mode *m)
 {
@@ -787,6 +826,322 @@ static void fl2000_kill_xfers(struct fl2000 *fl)
 			usb_kill_urb(fl->xfers[i].urb);
 }
 
+/*
+ * Isochronous path: one URB carries a whole frame (128 data packets plus
+ * empty padding). The xHCI schedules one packet per microframe, which
+ * makes the URB take exactly 133 * 125 us = 16.6 ms and keeps the chip's
+ * FIFO fed without any host-side pacing.
+ */
+static void fl2000_iso_complete(struct urb *urb)
+{
+	struct fl2000 *fl = urb->context;
+	unsigned int missed = 0, i;
+	int status = urb->status;
+
+	if (!status) {
+		for (i = 0; i < urb->number_of_packets; i++)
+			if (urb->iso_frame_desc[i].status)
+				missed++;
+	}
+	if (status || missed) {
+		atomic_add(missed, &fl->iso_missed);
+		WRITE_ONCE(fl->last_status, status ? status : -EREMOTEIO);
+	}
+	fl->completions++;
+	WRITE_ONCE(fl->last_complete, jiffies);
+	atomic_dec(&fl->iso_inflight);
+	up(&fl->iso_free);
+}
+
+static void fl2000_iso_stop(struct fl2000 *fl)
+{
+	unsigned int i;
+
+	for (i = 0; i < FL2000_ISO_URBS; i++)
+		if (fl->iso_urb[i])
+			usb_kill_urb(fl->iso_urb[i]);
+	atomic_set(&fl->iso_inflight, 0);
+}
+
+static void fl2000_iso_free(struct fl2000 *fl)
+{
+	unsigned int i;
+
+	fl2000_iso_stop(fl);
+	for (i = 0; i < FL2000_ISO_URBS; i++) {
+		usb_free_urb(fl->iso_urb[i]);
+		fl->iso_urb[i] = NULL;
+		if (fl->iso_buf[i])
+			usb_free_coherent(fl->udev, fl->iso_frame_len,
+					  fl->iso_buf[i], fl->iso_dma[i]);
+		fl->iso_buf[i] = NULL;
+	}
+	fl->iso = false;
+	if (fl->iso_alt && fl->udev->state == USB_STATE_CONFIGURED) {
+		usb_set_interface(fl->udev, 1, 0);
+		usb_set_interface(fl->udev, 0, 1);
+	}
+	fl->iso_alt = 0;
+}
+
+static int fl2000_iso_setup(struct fl2000 *fl)
+{
+	struct usb_device *udev = fl->udev;
+	struct usb_interface *intf = usb_ifnum_to_if(udev, 1);
+	struct usb_host_interface *alts;
+	struct usb_host_endpoint *he;
+	struct usb_endpoint_descriptor *ep = NULL;
+	unsigned int pkt_size, packets, alt = 0, i, e;
+	u16 bw = 0;
+	int ret;
+
+	if (!fl->mode || !fl->mode->iso_pll)
+		return -EOPNOTSUPP;
+	if (!intf || fl->wire_bpp == 0)
+		return -EOPNOTSUPP;
+
+	/* 128 data packets per frame at the chip's 8000 intervals/s */
+	pkt_size = fl->frame_len / FL2000_ISO_DATA_PACKETS;
+	if (!pkt_size || pkt_size * FL2000_ISO_DATA_PACKETS != fl->frame_len)
+		return -EINVAL;
+	packets = iso_pkts > 0 ? iso_pkts : fl->mode->iso_packets;
+	if (packets < FL2000_ISO_DATA_PACKETS)
+		return -EINVAL;
+
+	/* smallest altsetting whose declared bandwidth covers a packet */
+	for (i = 1; i < intf->num_altsetting; i++) {
+		alts = &intf->altsetting[i];
+		for (e = 0; e < alts->desc.bNumEndpoints; e++) {
+			he = &alts->endpoint[e];
+			if (!usb_endpoint_is_isoc_out(&he->desc))
+				continue;
+			bw = le16_to_cpu(he->ss_ep_comp.wBytesPerInterval);
+			if (bw && bw >= pkt_size) {
+				ep = &he->desc;
+				alt = alts->desc.bAlternateSetting;
+				break;
+			}
+		}
+		if (ep)
+			break;
+	}
+	if (!ep)
+		return -EOPNOTSUPP;
+
+	ret = usb_set_interface(udev, 1, alt);
+	if (ret)
+		return ret;
+	fl->iso_alt = alt;
+	fl->iso_pkt_size = pkt_size;
+	fl->iso_data_packets = FL2000_ISO_DATA_PACKETS;
+	fl->iso_packets = packets;
+	fl->iso_frame_len = fl->frame_len;
+
+	for (i = 0; i < FL2000_ISO_URBS; i++) {
+		fl->iso_urb[i] = usb_alloc_urb(packets, GFP_KERNEL);
+		if (!fl->iso_urb[i])
+			goto err;
+		fl->iso_buf[i] = usb_alloc_coherent(udev, fl->frame_len,
+						    GFP_KERNEL | __GFP_NOWARN,
+						    &fl->iso_dma[i]);
+		if (!fl->iso_buf[i])
+			goto err;
+		fl->iso_urb[i]->dev = udev;
+		fl->iso_urb[i]->pipe =
+			usb_sndisocpipe(udev, ep->bEndpointAddress);
+		fl->iso_urb[i]->transfer_buffer = fl->iso_buf[i];
+		fl->iso_urb[i]->transfer_buffer_length = fl->frame_len;
+		fl->iso_urb[i]->complete = fl2000_iso_complete;
+		fl->iso_urb[i]->context = fl;
+		fl->iso_urb[i]->interval = 1;
+		fl->iso_urb[i]->number_of_packets = packets;
+		fl->iso_urb[i]->transfer_dma = fl->iso_dma[i];
+		fl->iso_urb[i]->transfer_flags =
+			URB_NO_TRANSFER_DMA_MAP | URB_ISO_ASAP;
+	}
+
+	sema_init(&fl->iso_free, FL2000_ISO_URBS);
+	fl->iso_ring = 0;
+	atomic_set(&fl->iso_inflight, 0);
+	atomic_set(&fl->iso_missed, 0);
+	fl->iso = true;
+	fl->iso_pkt_count = packets;
+	drm_info(&fl->drm,
+		 "iso pipe: alt %u, %u packets (%u x %u bytes + %u empty), %u MB/s, eof=bit%u upd=%d\n",
+		 alt, packets, FL2000_ISO_DATA_PACKETS, pkt_size,
+		 packets - FL2000_ISO_DATA_PACKETS,
+		 (unsigned int)div_u64((u64)bw * 8000, 1000000),
+		 fl->iso_eof_bit, fl->iso_mframe_update);
+	return 0;
+
+err:
+	fl2000_iso_free(fl);
+	return -ENOMEM;
+}
+
+static int fl2000_iso_submit(struct fl2000 *fl, unsigned int slot)
+{
+	struct urb *urb = fl->iso_urb[slot];
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < urb->number_of_packets; i++) {
+		/*
+		 * Padding packets must stay inside the DMA buffer: the
+		 * HCD builds a TRB from offset + transfer_dma for every
+		 * descriptor, even zero-length ones.
+		 */
+		urb->iso_frame_desc[i].offset =
+			i < fl->iso_data_packets ?
+				i * fl->iso_pkt_size : fl->frame_len;
+		urb->iso_frame_desc[i].length =
+			i < fl->iso_data_packets ? fl->iso_pkt_size : 0;
+		urb->iso_frame_desc[i].actual_length = 0;
+		urb->iso_frame_desc[i].status = 0;
+	}
+	urb->transfer_flags |= URB_ISO_ASAP;
+	atomic_inc(&fl->iso_inflight);
+	ret = usb_submit_urb(urb, GFP_KERNEL);
+	if (ret)
+		atomic_dec(&fl->iso_inflight);
+	return ret;
+}
+
+static void fl2000_iso_work(struct work_struct *work)
+{
+	struct fl2000 *fl = container_of(work, struct fl2000, iso_work);
+	u32 frames = 0, missed_base = 0;
+	u16 iso_last_cnt = 0;
+	unsigned int timeouts = 0;
+	/* frozen-engine watch: 100 ms sampling, twice to confirm */
+	u64 fast_ts = 0;
+	u32 fast_cnt = 0;
+	bool fast_seen = false, fast_frozen = false;
+	unsigned long fast_reset_at = 0;
+	int idx, ret;
+
+	if (!drm_dev_enter(&fl->drm, &idx))
+		return;
+
+	while (READ_ONCE(fl->streaming)) {
+		unsigned int slot;
+		int tmo;
+
+		tmo = down_timeout(&fl->iso_free,
+				   msecs_to_jiffies(FL2000_ISO_SUBMIT_MS));
+		if (tmo) {
+			if (!READ_ONCE(fl->streaming))
+				break;
+			if (++timeouts >= FL2000_ISO_MAX_TIMEOUTS) {
+				drm_err(&fl->drm,
+					"iso pipe stalled (inflight=%d missed=%d), falling back to bulk\n",
+					atomic_read(&fl->iso_inflight),
+					atomic_read(&fl->iso_missed));
+				fl->iso_failed = true;
+				WRITE_ONCE(fl->streaming, false);
+				drm_kms_helper_hotplug_event(&fl->drm);
+				break;
+			}
+			continue;
+		}
+		timeouts = 0;
+
+		slot = fl->iso_ring;
+		fl->iso_ring ^= 1;
+
+		spin_lock(&fl->frame_swap_lock);
+		if (fl->frame_ready) {
+			swap(fl->send_buf, fl->ready_buf);
+			fl->frame_ready = false;
+		}
+		spin_unlock(&fl->frame_swap_lock);
+
+		memcpy(fl->iso_buf[slot], fl->send_buf, fl->frame_len);
+		ret = fl2000_iso_submit(fl, slot);
+		if (ret) {
+			up(&fl->iso_free);
+			if (fl2000_usb_err_fatal(ret)) {
+				drm_dbg(&fl->drm,
+					"device gone (%d), stream off\n", ret);
+				break;
+			}
+			if (++timeouts >= FL2000_ISO_MAX_TIMEOUTS) {
+				fl->iso_failed = true;
+				WRITE_ONCE(fl->streaming, false);
+				drm_kms_helper_hotplug_event(&fl->drm);
+				break;
+			}
+			msleep(20);
+			continue;
+		}
+
+		frames++;
+		if ((frames % 300) == 0) {
+			u32 missed = atomic_read(&fl->iso_missed);
+			u8 ite_st = 0xFF;
+			u32 st = 0;
+
+			if (fl->ite_present)
+				fl2000_ite_status(fl, &ite_st);
+			/* confirm the chip is consuming frames, not just the bus */
+			if (!fl2000_reg_read(fl, 0x8000, &st)) {
+				u16 cnt = FL2000_STATUS_FRAME_CNT(st);
+
+				drm_info(&fl->drm,
+					 "iso telemetry: %u frames, %u missed in window, %lu completions, ite=0x%02X last_status=%d, st=0x%08X hwfrm=+%u%s%s%s\n",
+					 frames, missed - missed_base, fl->completions,
+					 ite_st, READ_ONCE(fl->last_status), st,
+					 (u16)(cnt - iso_last_cnt),
+					 st & FL2000_STATUS_LBUF_UNDERFLOW ? " UNDER" : "",
+					 st & FL2000_STATUS_LBUF_OVERFLOW ? " OVER" : "",
+					 st & FL2000_STATUS_LBUF_HALT ? " HALT" : "");
+				iso_last_cnt = cnt;
+				/* sticky lbuf bits clear by writing them back */
+				if (st & (FL2000_STATUS_LBUF_OVERFLOW |
+					  FL2000_STATUS_LBUF_UNDERFLOW))
+					fl2000_reg_write(fl, 0x8000, st);
+			}
+			missed_base = missed;
+		}
+		/*
+		 * Freeze watch, same as the bulk worker: the engine can
+		 * freeze at the 16-bit counter wrap (observed saturating at
+		 * 0xFFFE) while the bus keeps delivering, and unlike bulk
+		 * there is no stall watchdog to notice. Two consecutive
+		 * 100 ms frozen samples filter the one-frame 0xFFFF a
+		 * healthy counter reads once per 65536-frame wrap; resets
+		 * are rate-limited to one per 2 s.
+		 */
+		if (ktime_get_ns() - fast_ts >= 100 * NSEC_PER_MSEC) {
+			u32 fst = 0;
+
+			fast_ts = ktime_get_ns();
+			if (!fl2000_reg_read_try(fl, 0x8000, &fst)) {
+				u32 cnt = FL2000_STATUS_FRAME_CNT(fst);
+				bool frozen = cnt == 0xFFFF ||
+					      (fast_seen && cnt == fast_cnt);
+
+				if (frozen && fast_frozen &&
+				    time_after(jiffies, fast_reset_at +
+					       msecs_to_jiffies(2000))) {
+					fl2000_chip_app_reset(fl, fst,
+							      "chip frame counter stuck");
+					fast_reset_at = jiffies;
+				}
+				fast_frozen = frozen;
+				fast_cnt = cnt;
+				fast_seen = true;
+			} else {
+				fast_frozen = false;
+			}
+		}
+		cond_resched();
+	}
+
+	fl2000_iso_stop(fl);
+	drm_dev_exit(idx);
+}
+
 static void fl2000_pipe_enable(struct drm_simple_display_pipe *pipe,
 			       struct drm_crtc_state *crtc_state,
 			       struct drm_plane_state *plane_state)
@@ -794,6 +1149,7 @@ static void fl2000_pipe_enable(struct drm_simple_display_pipe *pipe,
 	struct fl2000 *fl = to_fl2000(pipe->crtc.dev);
 	struct drm_display_mode *mode = &crtc_state->mode;
 	const struct fl2000_mode *m;
+	bool use_iso;
 	int idx, ret;
 
 	m = fl2000_hw_find_mode(mode->hdisplay, mode->vdisplay,
@@ -806,6 +1162,21 @@ static void fl2000_pipe_enable(struct drm_simple_display_pipe *pipe,
 
 	fl->wire_bpp = fl2000_wire_bpp_for(fl, m);
 	fl->frame_len = (size_t)m->width * m->height * fl->wire_bpp;
+	fl->mode = m;
+
+	/*
+	 * The isochronous pipe is only meaningful when the table carries
+	 * ISO PLL values and the port offers a SuperSpeed altsetting wide
+	 * enough for one packet per 125 us interval. Anything else (USB2,
+	 * other modes, a failed attempt) stays on bulk.
+	 */
+	fl->iso_eof_bit = iso_eof == 28 ? 28 : 29;
+	fl->iso_mframe_update = iso_upd != 0;
+	use_iso = iso && fl->usb3 && !fl->iso_failed && m->iso_pll &&
+		  m->iso_pkt_size &&
+		  (size_t)m->iso_pkt_size * FL2000_ISO_DATA_PACKETS ==
+			  fl->frame_len;
+
 	fl->write_buf = vzalloc(fl->frame_len);
 	fl->ready_buf = vzalloc(fl->frame_len);
 	fl->send_buf = vzalloc(fl->frame_len);
@@ -841,21 +1212,35 @@ static void fl2000_pipe_enable(struct drm_simple_display_pipe *pipe,
 			1000000000ULL, pclk);
 		fl->frame_period_ns = fl->period_pll_ns;
 	}
-	for (int i = 0; i < FL2000_NUM_XFERS; i++) {
-		fl->xfers[i].urb = usb_alloc_urb(0, GFP_KERNEL);
-		fl->xfers[i].buf = usb_alloc_coherent(fl->udev,
-						      FL2000_CHUNK_SIZE,
-						      GFP_KERNEL,
-						      &fl->xfers[i].dma);
-		if (!fl->xfers[i].urb || !fl->xfers[i].buf)
-			goto err_free;
+	if (use_iso) {
+		ret = fl2000_iso_setup(fl);
+		if (ret) {
+			drm_warn(&fl->drm,
+				 "iso setup failed: %d, using bulk\n", ret);
+			use_iso = false;
+		}
 	}
-	fl->mode = m;
+	if (!use_iso) {
+		/* bulk ring is the fallback, allocate it on demand only */
+		for (int i = 0; i < FL2000_NUM_XFERS; i++) {
+			fl->xfers[i].urb = usb_alloc_urb(0, GFP_KERNEL);
+			fl->xfers[i].buf = usb_alloc_coherent(fl->udev,
+							      FL2000_CHUNK_SIZE,
+							      GFP_KERNEL,
+							      &fl->xfers[i].dma);
+			if (!fl->xfers[i].urb || !fl->xfers[i].buf)
+				goto err_free;
+		}
+	}
+
+	if (use_iso)
+		fl->frame_period_ns = (u64)fl->iso_packets *
+				      FL2000_ISO_INTERVAL_NS;
 
 	ret = fl2000_hw_stream_prep(fl);
 	if (ret)
 		goto err_free;
-	ret = fl2000_hw_set_mode(fl, m, fl->wire_bpp);
+	ret = fl2000_hw_set_mode(fl, m, fl->wire_bpp, use_iso);
 	if (ret) {
 		drm_err(&fl->drm, "mode set failed: %d\n", ret);
 		goto err_free;
@@ -872,17 +1257,20 @@ static void fl2000_pipe_enable(struct drm_simple_display_pipe *pipe,
 		fl2000_reg_read(fl, 0x8004, &r8004);
 		fl2000_reg_read(fl, 0x803C, &r803c);
 		drm_info(&fl->drm,
-			 "streaming %ux%u@%u, %u bytes/px (fmt=%d pace=%d period=%lluns), 0x8004=0x%08X 0x803C=0x%08X\n",
-			 m->width, m->height, m->refresh, fl->wire_bpp, fmt,
-			 pace, fl->frame_period_ns, r8004, r803c);
+			 "streaming %ux%u@%u, %u bytes/px (%s fmt=%d pace=%d period=%lluns), 0x8004=0x%08X 0x803C=0x%08X\n",
+			 m->width, m->height, m->refresh, fl->wire_bpp,
+			 use_iso ? "iso" : "bulk", fmt, pace,
+			 fl->frame_period_ns, r8004, r803c);
 	}
 
 	WRITE_ONCE(fl->streaming, true);
-	queue_work(fl->stream_wq, &fl->stream_work);
+	queue_work(fl->stream_wq,
+		   use_iso ? &fl->iso_work : &fl->stream_work);
 	drm_dev_exit(idx);
 	return;
 
 err_free:
+	fl2000_iso_free(fl);
 	fl2000_free_frames(fl);
 	drm_dev_exit(idx);
 }
@@ -894,7 +1282,9 @@ static void fl2000_pipe_disable(struct drm_simple_display_pipe *pipe)
 
 	WRITE_ONCE(fl->streaming, false);
 	cancel_work_sync(&fl->stream_work);
+	cancel_work_sync(&fl->iso_work);
 	fl2000_kill_xfers(fl);
+	fl2000_iso_free(fl);
 
 	if (drm_dev_enter(&fl->drm, &idx)) {
 		if (fl->ite_present)
@@ -1169,6 +1559,7 @@ static int fl2000_probe(struct usb_interface *intf,
 	mutex_init(&fl->edid_lock);
 	spin_lock_init(&fl->frame_swap_lock);
 	INIT_WORK(&fl->stream_work, fl2000_stream_work);
+	INIT_WORK(&fl->iso_work, fl2000_iso_work);
 	INIT_WORK(&fl->status_work, fl2000_status_work);
 	INIT_WORK(&fl->intr_work, fl2000_intr_work);
 
@@ -1307,7 +1698,9 @@ static void fl2000_disconnect(struct usb_interface *intf)
 	cancel_work_sync(&fl->status_work);
 	WRITE_ONCE(fl->streaming, false);
 	cancel_work_sync(&fl->stream_work);
+	cancel_work_sync(&fl->iso_work);
 	fl2000_kill_xfers(fl);
+	fl2000_iso_stop(fl);
 	drm_atomic_helper_shutdown(drm);
 }
 

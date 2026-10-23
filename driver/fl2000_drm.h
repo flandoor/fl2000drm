@@ -28,6 +28,11 @@ struct fl2000_mode {
 	u8 vic;		/* CEA VIC for the AVI infoframe, 0 if none */
 	u8 vsync_time;	/* vsync width in lines (for DRM mode timings) */
 	u8 v_back_porch;
+	/* isochronous transfer variant, from big_table_16bit_r0 */
+	u32 iso_pll;		/* reg 0x802C, 0 = mode not ISO-capable */
+	u32 iso_h_sync_1;	/* reg 0x8008 */
+	u16 iso_pkt_size;	/* bytes per data packet at 60 Hz */
+	u16 iso_packets;	/* packets per frame at 60 Hz */
 };
 
 struct fl2000 {
@@ -96,6 +101,32 @@ struct fl2000 {
 	struct workqueue_struct *stream_wq;
 
 	/*
+	 * Isochronous path: interface 1, EP 0x02, one URB per frame with
+	 * 128 data packets + empty packets covering the 8000/s bus
+	 * intervals. The USB3 companion descriptor sets the bandwidth per
+	 * altsetting; the chip consumes the same pixel pipeline as bulk.
+	 */
+	struct usb_host_endpoint *iso_ep;
+	struct urb *iso_urb[2];
+	u8 *iso_buf[2];
+	dma_addr_t iso_dma[2];
+	size_t iso_frame_len;
+	unsigned int iso_packets;
+	unsigned int iso_data_packets;
+	unsigned int iso_pkt_size;
+	unsigned int iso_pkt_count;
+	unsigned int iso_eof_bit;
+	bool iso_mframe_update;
+	unsigned int iso_alt;
+	unsigned int iso_ring;
+	struct semaphore iso_free;
+	struct work_struct iso_work;
+	atomic_t iso_inflight;
+	atomic_t iso_missed;
+	bool iso;
+	bool iso_failed;
+
+	/*
 	 * Interrupt EP (EP3 IN on interface 2): the chip signals VGA
 	 * status events (monitor/EDID hotplug, frame drops, line-buffer
 	 * overflow/underflow) via reg 0x8000. RE instrumentation.
@@ -138,7 +169,7 @@ int fl2000_i2c_write32(struct fl2000 *fl, u8 addr, u8 offset, u32 val);
 int fl2000_hw_reset(struct fl2000 *fl);
 int fl2000_hw_dongle_init(struct fl2000 *fl);
 int fl2000_hw_set_mode(struct fl2000 *fl, const struct fl2000_mode *mode,
-		       u32 wire_bpp);
+		       u32 wire_bpp, bool iso);
 int fl2000_hw_stream_prep(struct fl2000 *fl);
 const struct fl2000_mode *fl2000_hw_find_mode(int width, int height,
 					      int refresh);

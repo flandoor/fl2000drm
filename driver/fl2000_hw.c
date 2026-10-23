@@ -217,7 +217,8 @@ static const struct fl2000_mode fl2000_modes[] = {
 	{ 1440,  900, 60, 0x5A00770, 0x0980181, 0x38403A6, 0x2060020, 0x00406106,  0, 0x6, 0x19 },
 	{ 1280, 1024, 60, 0x5000698, 0x0700169, 0x400042A, 0x2A3002A, 0x00616109,  0, 0x3, 0x26 },
 	{ 1680, 1050, 60, 0x69008C0, 0x0B001C9, 0x41A0441, 0x2560025, 0x00756204,  0, 0x6, 0x1E },
-	{ 1920, 1080, 60, 0x7800898, 0x02C00C1, 0x4380465, 0x2A5002A, 0x00596106, 16, 0x5, 0x24 },
+	{ 1920, 1080, 60, 0x7800898, 0x02C00C1, 0x4380465, 0x2A5002A, 0x00596106, 16, 0x5, 0x24,
+	  0x00776204, 0x7800897, 32400, 133 },
 	{ 1600, 1200, 60, 0x6400870, 0x0C001F1, 0x4B004E2, 0x3230032, 0x00616106,  0, 0x3, 0x2E },
 	/*
 	 * 2560x1080@60, synthesized from an LG ULTRAWIDE's native DTD
@@ -250,9 +251,11 @@ const struct fl2000_mode *fl2000_hw_find_mode(int width, int height,
 
 /* fl2000_monitor_set_resolution(), bulk pipe, EOF = zero-length packet */
 int fl2000_hw_set_mode(struct fl2000 *fl, const struct fl2000_mode *mode,
-		       u32 wire_bpp)
+		       u32 wire_bpp, bool iso)
 {
 	u32 h2 = mode->h_sync_2, v2 = mode->v_sync_2;
+	u32 pll = iso ? mode->iso_pll : mode->pll;
+	u32 h_sync_1 = iso ? mode->iso_h_sync_1 : mode->h_sync_1;
 	u32 val;
 	int ret;
 
@@ -268,16 +271,24 @@ int fl2000_hw_set_mode(struct fl2000 *fl, const struct fl2000_mode *mode,
 
 	mutex_lock(&fl->hw_lock);
 
-	ret = fl2000_reg_write_locked(fl, 0x802C, mode->pll);
+	ret = fl2000_reg_write_locked(fl, 0x802C, pll);
 	if (ret)
 		goto out;
+	/*
+	 * The vendor waits a full second for the PLL to stabilize *before*
+	 * the app reset, and only for isochronous transfers. The isoc PLL
+	 * (0x776204) drives the packet engine at a different rate from the
+	 * bulk one, so resetting early leaves it unlocked.
+	 */
+	if (iso)
+		msleep(1000);
 	ret = fl2000_reg_update_locked(fl, 0x8048, 0, BIT(15));
 	if (ret)
 		goto out;
 	ret = fl2000_reg_read_locked(fl, 0x802C, &val);
 	if (ret)
 		goto out;
-	if (val != mode->pll) {
+	if (val != pll) {
 		ret = -EIO;
 		goto out;
 	}
@@ -302,11 +313,13 @@ int fl2000_hw_set_mode(struct fl2000 *fl, const struct fl2000_mode *mode,
 				goto out;
 		}
 		/*
-		 * Bit 28 = EOF by ZLP. The alternative pending-bit mode
-		 * (bit 29) was tested on hardware: the chip NAKs the whole
-		 * bulk stream — do not use.
+		 * Bit 28 = EOF by ZLP for bulk. The alternative pending-bit
+		 * mode (bit 29) was tested on hardware and the chip NAKs the
+		 * whole bulk stream — do not use it there. Isochronous
+		 * transfers have no ZLP, so they use bit 29 instead.
 		 */
-		ret = fl2000_reg_update_locked(fl, 0x803C, 0, BIT(28));
+		ret = fl2000_reg_update_locked(fl, 0x803C, 0,
+					       BIT(iso ? fl->iso_eof_bit : 28));
 		if (ret)
 			goto out;
 	}
@@ -319,7 +332,15 @@ int fl2000_hw_set_mode(struct fl2000 *fl, const struct fl2000_mode *mode,
 	 * video-stable); tested and rejected as a blink fix.
 	 */
 	{
-		static const u8 clear_8004[] = { 28, 6, 31, 24, 25, 26, 27, 1 };
+		/*
+		 * Bit 13 is a latch-pollution sentinel: ISO experiments left
+		 * it set on our hardware (visible as 0x8004=0x00102**3**DC vs
+		 * the healthy 0x001003DC) and it survives app resets and mode
+		 * sets, degrading the bulk pipe (stalls/blinks every few
+		 * minutes). Only a power cycle restores the chip default; this
+		 * clear keeps it that way from then on.
+		 */
+		static const u8 clear_8004[] = { 28, 6, 31, 24, 25, 26, 27, 1, 13 };
 		int i;
 
 		for (i = 0; i < ARRAY_SIZE(clear_8004); i++) {
@@ -342,7 +363,7 @@ int fl2000_hw_set_mode(struct fl2000 *fl, const struct fl2000_mode *mode,
 			goto out;
 	}
 
-	ret = fl2000_reg_write_locked(fl, 0x8008, mode->h_sync_1);
+	ret = fl2000_reg_write_locked(fl, 0x8008, h_sync_1);
 	if (ret)
 		goto out;
 	ret = fl2000_reg_write_locked(fl, 0x800C, h2);
@@ -355,11 +376,21 @@ int fl2000_hw_set_mode(struct fl2000 *fl, const struct fl2000_mode *mode,
 	if (ret)
 		goto out;
 
-	/* clear isochronous config */
+	/*
+	 * 0x801C: bits 29:16 hold the number of packets per frame for the
+	 * isochronous pipe, bits 15:0 the idle interval. Bulk clears them.
+	 */
 	ret = fl2000_reg_read_locked(fl, 0x801C, &val);
 	if (ret)
 		goto out;
-	ret = fl2000_reg_write_locked(fl, 0x801C, val & 0xC000FFFF);
+	if (iso) {
+		val = (val & 0xC0000000) |
+		      ((fl->iso_pkt_count << 16) | 0x0120);
+		if (fl->iso_mframe_update)
+			val |= BIT(30);
+	} else
+		val &= 0xC000FFFF;
+	ret = fl2000_reg_write_locked(fl, 0x801C, val);
 	if (ret)
 		goto out;
 

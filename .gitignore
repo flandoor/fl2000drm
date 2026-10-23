@@ -16,5 +16,8 @@ __pycache__/
 # local artifacts
 edid.bin
 
+# harness binary (probe/fl2000_iso_test.c)
+probe/fl2000_iso_test
+
 # reference driver clones (see README — clone from FrescoLogic/FL2000)
 reference/

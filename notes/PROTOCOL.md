@@ -269,7 +269,58 @@ Hard-won constraints, in blood:
 - 2560x1080@60.13 (LG DTD timings, PLL 186.0 MHz) added to our mode table
   as first beyond-official-table synthesis — validation pending.
 
+## Isochronous + reduced-blanking investigation (2026-10-23)
+
+Everything below validated on hardware with `probe/fl2000_iso_test.c`, the
+userspace libusb harness built this session (bulk + iso bring-up, register
+pokes, packet-shape variants, feedback-EP polling, live 0x8000/0x8080/ITE
+status; build: `gcc -O2 -o fl2000_iso_test fl2000_iso_test.c $(pkg-config
+--cflags --libs libusb-1.0)`, run with the kernel module unloaded+blacklisted).
+
+- **ISO ingestion is impossible on Linux.** Bus delivery is perfect (0 missed
+  at IF1 alt 4, 294 MB/s contract; feedback EP 0x82 alive, 128 samples/s) but
+  the pixel engine consumes ZERO: feedback reads 0x00000000, lbuf underflows
+  continuously, ite never reaches video-stable. Root cause (structural): the
+  xHCI makes ONE TD per iso descriptor (xhci-ring.c: `num_tds =
+  urb->number_of_packets`) so the USB3 DP-header P bit is 0 at the end of every
+  32.4 kB interval — 128 "EOF" markers per frame — while the chip's
+  EOF_PENDING_BIT mode (0x803C bit 29) expects Windows-style one-TD-per-URB
+  transfers (P=0 once per frame). usbfs caps iso descriptors at ~32 kB
+  (32,400 fits by design) so multi-interval TDs can't be built from userspace.
+  Fixing it would need an xHCI patch. Dead end — documented, closed.
+- **EOF bit semantics**: bit 29 ("pending") also BREAKS the chip's video-out
+  generator (ITE never locks); bit 28 (ZLP-style) keeps video-out valid.
+  Bulk must use bit 28 (as the reference does); iso+bit28 gives valid syncs
+  but still no ingestion.
+- **HARDWARE CONSTRAINT (undocumented, bisected)**: the low 16 bits of 0x8014
+  (vsync+vbp+1) must be >= ~42 or the scan engine degrades to ~1/3 rate
+  (28 → 19 fps, 42 → 60 fps; minimum lies between). True CVT-RB (vblank 31)
+  is therefore IMPOSSIBLE on this chip — it needs a big vertical back porch.
+- **Custom timings/PLLs otherwise work**: htotal is freely reducible (2080
+  scans at full rate) and synthesized PLLs lock exactly (140.0 MHz = VCO 700,
+  mult 70/presc 1/div 5 → 59.96 Hz measured, VID-STABLE). The timing regs
+  (0x8008/0x800C/0x8010/0x8014) are LIVE — pokes take effect within a frame,
+  no app reset needed. The earlier "VCO 830 can't lock" theory was wrong:
+  the slow scans were the 0x8014-low16 constraint, not the PLL.
+- **But the monitor closes the door**: the Samsung LF27T35 displays only
+  CEA/DMT-standard timings — 2080×1125 and 2160×1125 at ~60 Hz produce black
+  (both HDMI with VIC 16 and DVI with no infoframe), 2199×1125 produced the
+  "Not optimum mode" OSD. CEA 1080p50 (2640×1125) keeps the same pixel clock
+  so it gains no drain margin. Intersection of chip (vblank >= 42) and monitor
+  (standard modes only) = plain CEA 1080p60. The reduced-drain mode idea is
+  dead on this hardware.
+- **Diagnostics**: 0x8080 = pixel-engine activity (live counter while
+  consuming; 0x02000000 bit 25 stuck = engine idle). 0x807C re-derives
+  per-mode packet sizes (reads 32400|32400 at 1080p). 0x801C re-derives after
+  timing changes. 0x8000 bit 3 ("iso_ack") never asserts under Linux xHCI.
+- **Driver hardened this session**: the iso worker got the 100 ms
+  frozen-engine watchdog (validated firing at the counter wrap on hardware)
+  plus UNDER/OVER flags and ITE status in its telemetry.
+- **USB audit**: the dongle is alone on its 10 Gbps root-hub segment — the
+  underflow jitter is intrinsic xHCI/CPU scheduling, not bus contention.
+
 ## Open questions / TODO
+
 
 - Compression details for USB2 at higher modes (fl2000_compression.c)
 - Interrupt EP semantics (fl2000_interrupt.c — monitor hotplug events)
